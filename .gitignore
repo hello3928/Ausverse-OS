@@ -1,0 +1,4 @@
+build/
+iso/
+*.iso
+disk.img
