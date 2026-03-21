@@ -2,11 +2,17 @@ CC      = gcc
 AS      = nasm
 LD      = ld
 
-CFLAGS  = -m32 -ffreestanding -fno-stack-protector -fno-pic -nostdlib -Wall -Wextra
-ASFLAGS = -f elf32
-LDFLAGS = -m elf_i386 -T linker.ld
+# -mno-red-zone: prevent the compiler using the 128-byte red zone below RSP,
+#                which gets clobbered by interrupt handlers in kernel mode.
+CFLAGS  = -m64 -ffreestanding -fno-stack-protector -fno-pic -mno-red-zone \
+          -nostdlib -Wall -Wextra
+ASFLAGS = -f elf64
+LDFLAGS = -m elf_x86_64 -T linker.ld
 
-OBJS    = build/boot.o build/gdt_flush.o build/isr.o build/kernel.o build/gdt.o build/idt.o
+OBJS    = build/boot.o build/gdt_flush.o build/isr.o build/irq.o \
+          build/kernel.o build/gdt.o build/idt.o build/pmm.o build/heap.o \
+          build/pic.o build/pit.o build/keyboard.o build/shell.o \
+          build/framebuffer.o build/font.o
 KERNEL  = build/kernel.bin
 ISO     = ausverseos.iso
 
@@ -30,7 +36,7 @@ iso: $(KERNEL)
 	grub-mkrescue -o $(ISO) iso
 
 run: iso
-	qemu-system-i386 -cdrom $(ISO) -display curses
+	qemu-system-x86_64 -cdrom $(ISO) -vga std -m 128 -display sdl -global VGA.vgamem_mb=16
 
 build:
 	mkdir -p build

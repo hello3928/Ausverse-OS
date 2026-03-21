@@ -1,20 +1,25 @@
-bits 32
+bits 64
 
 global gdt_flush
 
-; void gdt_flush(uint32_t gdtp_addr)
-; Loads the GDT and reloads all segment registers.
+; void gdt_flush(struct gdt_ptr *gdtp)
+;
+; In the x86-64 SysV ABI the first argument arrives in rdi.
+; In 64-bit mode lgdt expects a 10-byte descriptor (2-byte limit + 8-byte base).
+; We reload CS via a far-return rather than a far-jump because NASM cannot
+; encode a 64-bit far jump directly.
 gdt_flush:
-    mov eax, [esp + 4]  ; gdtp_addr argument
-    lgdt [eax]          ; load the GDT
+    lgdt [rdi]
 
-    ; Reload code segment via a far jump.
-    ; 0x08 = selector for entry 1 (kernel code): index 1, TI=0, RPL=0
-    jmp 0x08:.flush
+    ; Reload CS: push the new selector and the return address onto the stack,
+    ; then execute a 64-bit far return (retfq).
+    push 0x08                       ; kernel code selector
+    lea  rax, [rel .flush]
+    push rax
+    retfq
 
 .flush:
-    ; 0x10 = selector for entry 2 (kernel data): index 2, TI=0, RPL=0
-    mov ax, 0x10
+    mov ax, 0x10                    ; kernel data selector
     mov ds, ax
     mov es, ax
     mov fs, ax

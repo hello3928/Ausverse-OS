@@ -1,97 +1,84 @@
 #include <stdint.h>
-#include <stddef.h>
 #include "../include/gdt.h"
 #include "../include/idt.h"
 #include "../include/vga.h"
+#include "../include/framebuffer.h"
+#include "../include/pmm.h"
+#include "../include/heap.h"
+#include "../include/pic.h"
+#include "../include/pit.h"
+#include "../include/keyboard.h"
+#include "../include/shell.h"
+#include "../include/multiboot2.h"
 
-#define VGA_WIDTH  80
-#define VGA_HEIGHT 25
-#define VGA_MEMORY ((uint16_t *)0xB8000)
+/* ------------------------------------------------------------------ */
+/* Parse framebuffer info from Multiboot2 tags                         */
+/* ------------------------------------------------------------------ */
+static void parse_mbi(struct mb2_info *mbi) {
+    struct mb2_tag *tag = (struct mb2_tag *)mbi->tags;
 
-/* VGA text-mode colours */
-enum vga_colour {
-    VGA_BLACK   = 0,
-    VGA_BLUE    = 1,
-    VGA_GREEN   = 2,
-    VGA_CYAN    = 3,
-    VGA_RED     = 4,
-    VGA_MAGENTA = 5,
-    VGA_BROWN   = 6,
-    VGA_LGREY   = 7,
-    VGA_DGREY   = 8,
-    VGA_LBLUE   = 9,
-    VGA_LGREEN  = 10,
-    VGA_LCYAN   = 11,
-    VGA_LRED    = 12,
-    VGA_LMAG    = 13,
-    VGA_YELLOW  = 14,
-    VGA_WHITE   = 15,
-};
+    while (tag->type != MB2_TAG_END) {
+        if (tag->type == MB2_TAG_FRAMEBUFFER) {
+            struct mb2_tag_framebuffer *fb =
+                (struct mb2_tag_framebuffer *)tag;
+            fb_init(fb->addr, fb->width, fb->height, fb->pitch, fb->bpp);
+        }
 
-static uint16_t *vga_buf = VGA_MEMORY;
-static size_t vga_row = 0;
-static size_t vga_col = 0;
-static uint8_t vga_clr;
-
-static inline uint8_t make_colour(uint8_t fg, uint8_t bg) {
-    return fg | (bg << 4);
-}
-
-static inline uint16_t make_entry(char c, uint8_t colour) {
-    return (uint16_t)(uint8_t)c | ((uint16_t)colour << 8);
-}
-
-void vga_init(void) {
-    vga_clr = make_colour(VGA_WHITE, VGA_BLACK);
-    vga_row = vga_col = 0;
-    for (size_t i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++)
-        vga_buf[i] = make_entry(' ', vga_clr);
-}
-
-static void vga_scroll(void) {
-    for (size_t row = 1; row < VGA_HEIGHT; row++)
-        for (size_t col = 0; col < VGA_WIDTH; col++)
-            vga_buf[(row - 1) * VGA_WIDTH + col] = vga_buf[row * VGA_WIDTH + col];
-    for (size_t col = 0; col < VGA_WIDTH; col++)
-        vga_buf[(VGA_HEIGHT - 1) * VGA_WIDTH + col] = make_entry(' ', vga_clr);
-    vga_row = VGA_HEIGHT - 1;
-}
-
-void vga_putchar(char c) {
-    if (c == '\n') {
-        vga_col = 0;
-        if (++vga_row == VGA_HEIGHT)
-            vga_scroll();
-        return;
+        uint32_t next = (uint32_t)(uintptr_t)tag + tag->size;
+        next = (next + 7) & ~7u;
+        tag = (struct mb2_tag *)(uintptr_t)next;
     }
-    vga_buf[vga_row * VGA_WIDTH + vga_col] = make_entry(c, vga_clr);
-    if (++vga_col == VGA_WIDTH) {
-        vga_col = 0;
-        if (++vga_row == VGA_HEIGHT)
-            vga_scroll();
-    }
+
+    pmm_init(mbi);
 }
 
-void vga_print(const char *s) {
-    for (; *s; s++)
-        vga_putchar(*s);
-}
-
+/* ------------------------------------------------------------------ */
+/* Kernel entry point                                                   */
+/* ------------------------------------------------------------------ */
 void kernel_main(uint32_t magic, void *mbi) {
     (void)magic;
-    (void)mbi;
+
+    parse_mbi((struct mb2_info *)mbi);
 
     vga_init();
-    vga_print("AusverseOS v0.1\n");
+    vga_print_colored("AusverseOS v0.1\n", VGA_YELLOW, VGA_BLACK);
 
     gdt_init();
-    vga_print("[OK] GDT loaded\n");
+    vga_print_colored("[OK] ", VGA_LGREEN, VGA_BLACK);
+    vga_print("GDT loaded\n");
 
     idt_init();
-    vga_print("[OK] IDT loaded\n");
+    vga_print_colored("[OK] ", VGA_LGREEN, VGA_BLACK);
+    vga_print("IDT loaded\n");
 
-    vga_print("Kernel ready.\n");
+    vga_print_colored("[OK] ", VGA_LGREEN, VGA_BLACK);
+    vga_print("PMM initialised - ");
+    vga_print_colored("", VGA_LCYAN, VGA_BLACK);
+    vga_print_uint(pmm_free_pages() * PAGE_SIZE / 1024 / 1024);
+    vga_set_color(VGA_WHITE, VGA_BLACK);
+    vga_print(" MiB free\n");
 
-    for (;;)
-        __asm__ volatile ("hlt");
+    heap_init();
+    vga_print_colored("[OK] ", VGA_LGREEN, VGA_BLACK);
+    vga_print("Heap initialised\n");
+
+    pic_init();
+    vga_print_colored("[OK] ", VGA_LGREEN, VGA_BLACK);
+    vga_print("PIC remapped\n");
+
+    pit_init();
+    irq_register(0, pit_tick);
+    pic_unmask(0);
+    vga_print_colored("[OK] ", VGA_LGREEN, VGA_BLACK);
+    vga_print("PIT configured\n");
+
+    __asm__ volatile ("sti");
+    vga_print_colored("[OK] ", VGA_LGREEN, VGA_BLACK);
+    vga_print("Interrupts enabled\n");
+
+    keyboard_init();
+    vga_print_colored("[OK] ", VGA_LGREEN, VGA_BLACK);
+    vga_print("Keyboard driver loaded\n");
+
+    shell_run();
 }
