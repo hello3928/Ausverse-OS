@@ -11,9 +11,9 @@
 /* Chrome constants — must match render.c                             */
 /* ------------------------------------------------------------------ */
 
-#define TITLEBAR_H  (FONT_HEIGHT + 4)
-#define CHROME_BTN  (TITLEBAR_H - 2)
-#define TASKBAR_H   32
+#define TITLEBAR_H  (FONT_HEIGHT + 10)  /* must match render.c */
+#define CHROME_BTN  16                  /* must match render.c */
+#define TASKBAR_H   44
 
 /* ------------------------------------------------------------------ */
 /* Window table                                                        */
@@ -45,24 +45,26 @@ static int pt_in(int32_t x, int32_t y, struct rect r) {
            y >= r.y && y < r.y + r.h;
 }
 
-/* Drag zone: title bar minus the chrome buttons on the right */
+/* Drag zone: title bar minus the chrome buttons on the right.
+   Matches the title_bar rect in surf_window minus the button area. */
 static struct rect tb_zone(struct rect wr) {
-    int32_t btn_w = 3 * (CHROME_BTN + 1);
-    return make_rect(wr.x + 2, wr.y + 2, wr.w - 4 - btn_w, TITLEBAR_H);
+    int32_t btn_area = 3 * (CHROME_BTN + 2) + 4; /* 3 buttons + gaps */
+    return make_rect(wr.x + 1, wr.y + 1, wr.w - 2 - btn_area, TITLEBAR_H);
 }
 
-/* Close [X] button rect — must match render.c */
+/* Close [X] button rect — must match render.c surf_window exactly */
 static struct rect close_zone(struct rect wr) {
-    return make_rect(wr.x + wr.w - 2 - CHROME_BTN, wr.y + 2,
+    int32_t by = wr.y + 1 + (TITLEBAR_H - CHROME_BTN) / 2;
+    return make_rect(wr.x + wr.w - 3 - CHROME_BTN, by,
                      CHROME_BTN, CHROME_BTN);
 }
 
-/* Content area inside the sunken inner border */
+/* Client area — must match the 'client' rect in surf_window exactly */
 static struct rect client_zone(struct rect wr) {
-    return make_rect(wr.x + 3,
-                     wr.y + 4 + TITLEBAR_H,
-                     wr.w - 6,
-                     wr.h - 7 - TITLEBAR_H);
+    return make_rect(wr.x + 1,
+                     wr.y + 2 + TITLEBAR_H,
+                     wr.w - 2,
+                     wr.h - 3 - TITLEBAR_H);
 }
 
 static int32_t taskbar_y(void) {
@@ -70,7 +72,7 @@ static int32_t taskbar_y(void) {
 }
 
 static struct rect start_rect(void) {
-    return make_rect(4, taskbar_y() + 3, 72, TASKBAR_H - 6);
+    return make_rect(8, taskbar_y() + 7, 72, TASKBAR_H - 14);
 }
 
 /* ------------------------------------------------------------------ */
@@ -92,25 +94,8 @@ static void fmt2(char *buf, uint32_t n) {
     buf[1] = '0' + (char)(n % 10);
 }
 
-/* ------------------------------------------------------------------ */
-/* Mouse cursor                                                        */
-/* ------------------------------------------------------------------ */
-
-static void draw_cursor(struct surface *s, int32_t x, int32_t y) {
-    /* Right triangle: top-left hot spot, 16px wide at top, tapering right */
-    for (int32_t r = 0; r < 16; r++) {
-        for (int32_t c = 0; c <= 15 - r; c++) {
-            int32_t px = x + c, py = y + r;
-            if (px < 0 || py < 0 ||
-                (uint32_t)px >= s->width ||
-                (uint32_t)py >= s->height) continue;
-            /* Black border on edges, white fill inside */
-            int edge = (c == 0) || (r == 0) || (c + r == 15);
-            s->pixels[(uint32_t)py * s->stride + (uint32_t)px] =
-                edge ? COL_BLACK : COL_WHITE;
-        }
-    }
-}
+/* Cursor is composited at flush time by render_flush_with_cursor().
+   It is never drawn into the scene buffer. */
 
 /* ------------------------------------------------------------------ */
 /* Taskbar                                                             */
@@ -119,26 +104,37 @@ static void draw_cursor(struct surface *s, int32_t x, int32_t y) {
 static void draw_taskbar(struct surface *s) {
     int32_t ty = taskbar_y();
     int32_t sw = (int32_t)s->width;
+    int32_t cy = ty + (TASKBAR_H - (int32_t)FONT_HEIGHT) / 2;
 
-    surf_fill_rect(s, make_rect(0, ty, sw, TASKBAR_H), COL_WIN_FACE);
-    surf_raised(s,    make_rect(0, ty, sw, TASKBAR_H));
+    /* Background */
+    surf_fill_rect(s, make_rect(0, ty, sw, TASKBAR_H), COL_TASKBAR_BG);
 
-    surf_button(s, start_rect(), "Start", 0);
+    /* Top border */
+    surf_hline(s, 0, ty, sw, COL_TASKBAR_BORDER);
 
-    /* Uptime clock */
+    /* Start button — flat, accent blue */
+    struct rect sb = start_rect();
+    surf_fill_rect(s, sb, COL_START_BG);
+    {
+        int32_t lw = (int32_t)(5 * FONT_WIDTH); /* "Start" */
+        int32_t lx = sb.x + (sb.w - lw) / 2;
+        int32_t ly = sb.y + (sb.h - (int32_t)FONT_HEIGHT) / 2;
+        surf_text(s, lx, ly, "Start", COL_WHITE, COL_START_BG);
+    }
+
+    /* Uptime clock — right-aligned */
     uint64_t secs = pit_ticks() / PIT_HZ;
     uint32_t hh   = (uint32_t)(secs / 3600);
     uint32_t mm   = (uint32_t)((secs / 60) % 60);
     uint32_t ss   = (uint32_t)(secs % 60);
-    char clk[9]; /* "HH:MM:SS\0" */
+    char clk[9];
     fmt2(clk + 0, hh); clk[2] = ':';
     fmt2(clk + 3, mm); clk[5] = ':';
     fmt2(clk + 6, ss); clk[8] = '\0';
 
     int32_t cw = (int32_t)(wm_slen(clk) * FONT_WIDTH);
-    int32_t cx = sw - cw - 8;
-    int32_t cy = ty + (TASKBAR_H - (int32_t)FONT_HEIGHT) / 2;
-    surf_text(s, cx, cy, clk, COL_WIN_TEXT, COL_WIN_FACE);
+    int32_t cx = sw - cw - 12;
+    surf_text(s, cx, cy, clk, COL_TASKBAR_TEXT, COL_TASKBAR_BG);
 }
 
 /* ------------------------------------------------------------------ */
@@ -154,15 +150,35 @@ static void wm_render(void) {
         wm_win_t *w = &wins[zo[i]];
         if (!w->visible) continue;
         int active = (i == nw - 1);
+
+        /* Draw chrome (fills client area with COL_WIN_FACE) */
         surf_window(s, w->rect, w->title, active);
-        if (w->paint)
-            w->paint(s, client_zone(w->rect), w->ud);
+
+        /* Build a sub-surface that points directly into the screen buffer
+         * at the client area origin.  stride = screen stride so every row
+         * address is correct.  No heap allocation required. */
+        if (w->paint) {
+            struct rect cl = client_zone(w->rect);
+            int32_t cx = cl.x, cy = cl.y;
+            int32_t cw = cl.w, ch = cl.h;
+            /* Clip to screen — bail if origin is off the left/top edge */
+            if (cx < 0 || cy < 0) continue;
+            if (cx >= (int32_t)s->width || cy >= (int32_t)s->height) continue;
+            if (cx + cw > (int32_t)s->width)  cw = (int32_t)s->width  - cx;
+            if (cy + ch > (int32_t)s->height) ch = (int32_t)s->height - cy;
+            if (cw <= 0 || ch <= 0) continue;
+
+            struct surface cs;
+            cs.pixels = s->pixels + (uint32_t)cy * s->stride + (uint32_t)cx;
+            cs.width  = (uint32_t)cw;
+            cs.height = (uint32_t)ch;
+            cs.stride = s->stride;   /* screen row width — keeps rows aligned */
+            w->paint(&cs, w->ud);
+        }
     }
 
     draw_taskbar(s);
-
-    mouse_state_t m = mouse_get();
-    draw_cursor(s, m.x, m.y);
+    /* Cursor is added by render_flush_with_cursor — not part of scene. */
 }
 
 /* ------------------------------------------------------------------ */
@@ -181,20 +197,30 @@ void wm_raise(int id) {
 /* Event handling                                                      */
 /* ------------------------------------------------------------------ */
 
+static int wm_dirty    = 1; /* scene changed — full repaint needed  */
+static int cursor_dirty = 1; /* only cursor moved — re-flush is enough */
+
 static void handle_mouse(void) {
     mouse_state_t m  = mouse_get();
     uint8_t pressed  =  m.buttons & ~prev_m.buttons;
     uint8_t released = ~m.buttons &  prev_m.buttons;
 
+    /* Pure cursor movement: only need a re-flush, not a scene repaint */
+    if (m.x != prev_m.x || m.y != prev_m.y)
+        cursor_dirty = 1;
+
+    /* Button state change always triggers a scene repaint */
+    if (m.buttons != prev_m.buttons)
+        wm_dirty = 1;
+
     if (drag_id >= 0) {
         wins[drag_id].rect.x = m.x - drag_ox;
         wins[drag_id].rect.y = m.y - drag_oy;
-        /* Keep title bar on screen */
-        if (wins[drag_id].rect.y < 0)              wins[drag_id].rect.y = 0;
+        if (wins[drag_id].rect.y < 0)               wins[drag_id].rect.y = 0;
         if (wins[drag_id].rect.y > taskbar_y() - 4) wins[drag_id].rect.y = taskbar_y() - 4;
         if (released & 1) drag_id = -1;
+        wm_dirty = 1;
     } else if (pressed & 1) {
-        /* Hit test from topmost window down */
         for (int i = nw - 1; i >= 0; i--) {
             int id = zo[i];
             wm_win_t *w = &wins[id];
@@ -202,10 +228,12 @@ static void handle_mouse(void) {
 
             if (pt_in(m.x, m.y, close_zone(w->rect))) {
                 wm_close(id);
+                wm_dirty = 1;
                 break;
             }
 
             wm_raise(id);
+            wm_dirty = 1;
 
             if (pt_in(m.x, m.y, tb_zone(w->rect))) {
                 drag_id = id;
@@ -223,7 +251,7 @@ static void handle_key(void) {
     char c = keyboard_getchar();
     if (!c || nw == 0) return;
     int id = zo[nw - 1];
-    if (wins[id].on_key) wins[id].on_key(c, wins[id].ud);
+    if (wins[id].on_key) { wins[id].on_key(c, wins[id].ud); wm_dirty = 1; }
 }
 
 /* ------------------------------------------------------------------ */
@@ -276,18 +304,32 @@ void wm_close(int id) {
 
 void wm_run(void) {
     render_pause_auto(1);   /* stop PIT from flushing mid-frame */
-    uint64_t last_tick = 0;
+    uint64_t last_sec = pit_ticks() / PIT_HZ;
+    wm_dirty    = 1;
+    cursor_dirty = 1;
 
     while (nw > 0) {
-        __asm__ volatile ("hlt");   /* wait for next IRQ (mouse/keyboard/timer) */
+        __asm__ volatile ("hlt");   /* sleep until next IRQ (mouse/key/timer) */
         handle_mouse();
         handle_key();
 
-        uint64_t now = pit_ticks();
-        if (now - last_tick >= 2) {     /* ~50 fps */
-            last_tick = now;
+        /* Force scene redraw once per second so the taskbar clock updates */
+        uint64_t now_sec = pit_ticks() / PIT_HZ;
+        if (now_sec != last_sec) { last_sec = now_sec; wm_dirty = 1; }
+
+        mouse_state_t m = mouse_get();
+
+        if (wm_dirty) {
+            /* Scene changed: repaint everything, then flush with cursor */
+            wm_dirty    = 0;
+            cursor_dirty = 0;
             wm_render();
-            render_flush_now();         /* flush complete frame atomically */
+            render_flush_with_cursor(m.x, m.y);
+        } else if (cursor_dirty) {
+            /* Only cursor moved: re-flush the unchanged scene with cursor
+             * at its new position.  No scene repaint — O(1) cost. */
+            cursor_dirty = 0;
+            render_flush_with_cursor(m.x, m.y);
         }
     }
 

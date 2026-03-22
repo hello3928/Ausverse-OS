@@ -13,6 +13,8 @@
 #include "gui/wm.h"
 #include "gui/render.h"
 #include "gui/font.h"
+#include "net/net.h"
+#include "core/pkg.h"
 
 /* ------------------------------------------------------------------ */
 /* Minimal string utilities (no stdlib)                                */
@@ -198,6 +200,40 @@ static void parse(const char *input) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Shell header                                                         */
+/* Rows 0-2 are reserved for the static header; the interactive prompt */
+/* always starts at row SHELL_PROMPT_ROW so readline can never move    */
+/* the cursor into the header area.                                    */
+/* ------------------------------------------------------------------ */
+
+#define SHELL_PROMPT_ROW 3u
+
+static void shell_draw_header(void) {
+    vga_init();   /* clear screen, reset cursor to (0,0) */
+
+    /* Row 0 — coloured title bar */
+    fb_fill_rect(0, 0, fb_cols() * FONT_WIDTH, FONT_HEIGHT, 0x1A1A2E);
+    fb_draw_hline(0, FONT_HEIGHT - 1, fb_cols() * FONT_WIDTH, 0x4444AA);
+    fb_set_cursor(1, 0);
+    vga_print_colored("AusverseOS", VGA_YELLOW, VGA_BLACK);
+    vga_set_color(VGA_WHITE, VGA_BLACK);
+
+    /* Row 1 — description */
+    fb_set_cursor(0, 1);
+    vga_print_colored("AusverseOS shell", VGA_YELLOW, VGA_BLACK);
+    vga_print(" - type ");
+    vga_print_colored("help", VGA_LCYAN, VGA_BLACK);
+    vga_print(" for commands");
+
+    /* Row 2 — separator line */
+    fb_set_cursor(0, 2);
+    fb_draw_hline(0, 2 * FONT_HEIGHT, fb_cols() * FONT_WIDTH, 0x444444);
+
+    /* Lock cursor below the header — readline saves this as its floor */
+    fb_set_cursor(0, SHELL_PROMPT_ROW);
+}
+
+/* ------------------------------------------------------------------ */
 /* Commands                                                             */
 /* ------------------------------------------------------------------ */
 
@@ -223,9 +259,13 @@ static void cmd_help(void) {
     vga_print_colored("  cp       ", VGA_LCYAN, VGA_BLACK); vga_print("copy file\n");
     vga_print_colored("  mv       ", VGA_LCYAN, VGA_BLACK); vga_print("move/rename file\n");
     vga_print_colored("  hexdump  ", VGA_LCYAN, VGA_BLACK); vga_print("hex dump file contents\n");
+    vga_print_colored("Network:\n", VGA_YELLOW, VGA_BLACK);
+    vga_print_colored("  ifconfig ", VGA_LCYAN, VGA_BLACK); vga_print("show IP and MAC address\n");
+    vga_print_colored("  ping     ", VGA_LCYAN, VGA_BLACK); vga_print("ping an IP address\n");
+    vga_print_colored("  pkg      ", VGA_LCYAN, VGA_BLACK); vga_print("package manager (list, install)\n");
 }
 
-static void cmd_clear(void) { vga_init(); }
+static void cmd_clear(void) { shell_draw_header(); }
 
 static void cmd_echo(void) {
     /* Find '>' redirect operator */
@@ -385,13 +425,146 @@ static void cmd_mv(void) {
 static void cmd_whoami(void) { vga_print("root\n"); }
 static void cmd_uname(void)  { vga_print("AusverseOS x86_64 v0.2\n"); }
 
-static void welcome_paint(struct surface *s, struct rect c, void *ud) {
+static void cmd_ifconfig(void) {
+    if (!e1000_present()) {
+        vga_print_colored("No network adapter\n", VGA_LRED, VGA_BLACK);
+        return;
+    }
+    uint8_t mac[6], ip[4];
+    net_get_mac(mac);
+    net_get_ip(ip);
+    vga_print("MAC: ");
+    for (int i = 0; i < 6; i++) {
+        vga_print_colored("", VGA_LCYAN, VGA_BLACK);
+        /* print hex byte */
+        const char *h = "0123456789abcdef";
+        vga_putchar(h[mac[i] >> 4]);
+        vga_putchar(h[mac[i] & 0xF]);
+        vga_set_color(VGA_WHITE, VGA_BLACK);
+        if (i < 5) vga_putchar(':');
+    }
+    vga_putchar('\n');
+    vga_print("IP:  ");
+    vga_print_colored("", VGA_LGREEN, VGA_BLACK);
+    for (int i = 0; i < 4; i++) {
+        vga_print_uint(ip[i]);
+        if (i < 3) vga_putchar('.');
+    }
+    vga_set_color(VGA_WHITE, VGA_BLACK);
+    vga_putchar('\n');
+}
+
+static void cmd_ping(void) {
+    if (argc < 2) { vga_print("usage: ping <ip>\n"); return; }
+    /* Parse dotted-decimal */
+    const char *s = argv[1];
+    uint32_t ip = 0;
+    for (int oct = 0; oct < 4; oct++) {
+        uint32_t v = 0;
+        while (*s >= '0' && *s <= '9') v = v * 10 + (uint32_t)(*s++ - '0');
+        if (*s == '.') s++;
+        ip = (ip << 8) | (v & 0xFF);
+    }
+    ip4_t target = htonl(ip);
+    vga_print("PING "); vga_print(argv[1]); vga_print(" ...\n");
+    int ms = net_ping(target, 3000);
+    if (ms < 0) {
+        vga_print_colored("Request timeout\n", VGA_LRED, VGA_BLACK);
+    } else {
+        vga_print("Reply from ");
+        vga_print(argv[1]);
+        vga_print(": time=");
+        vga_print_uint((uint32_t)ms);
+        vga_print(" ms\n");
+    }
+}
+
+static void cmd_pkg_sh(void) { cmd_pkg(argc, argv); }
+
+/* Convert n to decimal string; returns number of chars written. */
+static int32_t fmt_u32(char *buf, int32_t cap, uint32_t n) {
+    char tmp[12]; int32_t i = 0;
+    if (!n) { tmp[i++] = '0'; }
+    else { while (n && i < 12) { tmp[i++] = '0' + (char)(n % 10); n /= 10; } }
+    int32_t j = 0;
+    while (i > 0 && j < cap - 1) buf[j++] = tmp[--i];
+    if (j < cap) buf[j] = '\0';
+    return j;
+}
+
+/* Append a string literal into buf[pos..cap]; returns new pos. */
+static int32_t fmt_str(char *buf, int32_t cap, int32_t pos, const char *s) {
+    while (*s && pos < cap - 1) buf[pos++] = *s++;
+    buf[pos] = '\0';
+    return pos;
+}
+
+static void welcome_paint(struct surface *s, void *ud) {
     (void)ud;
-    int32_t y = c.y + 8;
-    surf_text(s, c.x + 8, y, "Welcome to AusverseOS v0.2",   COL_WIN_TEXT, COL_WIN_FACE); y += FONT_HEIGHT + 4;
-    surf_text(s, c.x + 8, y, "x86-64  |  128 MB RAM",        COL_WIN_TEXT, COL_WIN_FACE); y += FONT_HEIGHT + 4;
-    surf_text(s, c.x + 8, y, "FAT32  |  PS/2 Keyboard+Mouse",COL_WIN_TEXT, COL_WIN_FACE); y += FONT_HEIGHT + 12;
-    surf_text(s, c.x + 8, y, "Close windows to return to shell.", COL_WIN_TEXT, COL_WIN_FACE);
+
+    /* Layout constants */
+    const int32_t lx = 20;           /* label column x */
+    const int32_t vx = 160;          /* value column x */
+    const int32_t ls = FONT_HEIGHT + 8; /* line spacing */
+    int32_t y = 18;
+
+    /* ---- Title ---- */
+    surf_text(s, lx, y, "AUSVERSEOS v0.2", COL_ACCENT, COL_WIN_FACE);
+    y += ls;
+    surf_hline(s, lx, y - 4, (int32_t)s->width - lx * 2, COL_WIN_BORDER_A);
+
+    /* ---- Uptime ---- */
+    y += 4;
+    uint64_t secs = pit_ticks() / PIT_HZ;
+    uint32_t hh = (uint32_t)(secs / 3600);
+    uint32_t mm = (uint32_t)((secs / 60) % 60);
+    uint32_t ss = (uint32_t)(secs % 60);
+    char uptime[9];
+    uptime[0] = '0' + (char)((hh / 10) % 10); uptime[1] = '0' + (char)(hh % 10); uptime[2] = ':';
+    uptime[3] = '0' + (char)((mm / 10) % 10); uptime[4] = '0' + (char)(mm % 10); uptime[5] = ':';
+    uptime[6] = '0' + (char)((ss / 10) % 10); uptime[7] = '0' + (char)(ss % 10); uptime[8] = '\0';
+    surf_text(s, lx, y, "UPTIME",        COL_LABEL,  COL_WIN_FACE);
+    surf_text(s, vx, y, uptime,          COL_WIN_TEXT, COL_WIN_FACE);
+    y += ls;
+
+    /* ---- Memory ---- */
+    uint32_t total_mb = pmm_total_pages() * PAGE_SIZE / 1024 / 1024;
+    uint32_t free_mb  = pmm_free_pages()  * PAGE_SIZE / 1024 / 1024;
+    uint32_t used_mb  = total_mb - free_mb;
+    char mem[48]; int32_t p = 0;
+    p += fmt_u32(mem + p, 48 - p, used_mb);
+    p  = fmt_str(mem, 48, p, " MB / ");
+    p += fmt_u32(mem + p, 48 - p, total_mb);
+         fmt_str(mem, 48, p, " MB");
+    surf_text(s, lx, y, "MEMORY",        COL_LABEL,  COL_WIN_FACE);
+    surf_text(s, vx, y, mem,             COL_WIN_TEXT, COL_WIN_FACE);
+    y += ls;
+
+    /* ---- Free pages ---- */
+    char pages[32]; int32_t pp = 0;
+    pp += fmt_u32(pages + pp, 32 - pp, pmm_free_pages());
+    fmt_str(pages, 32, pp, " pages");
+    surf_text(s, lx, y, "FREE MEM",      COL_LABEL,  COL_WIN_FACE);
+    surf_text(s, vx, y, pages,           COL_WIN_TEXT, COL_WIN_FACE);
+    y += ls;
+
+    /* ---- Static info ---- */
+    surf_text(s, lx, y, "ARCH",          COL_LABEL,  COL_WIN_FACE);
+    surf_text(s, vx, y, "x86-64",        COL_WIN_TEXT, COL_WIN_FACE);
+    y += ls;
+
+    surf_text(s, lx, y, "STORAGE",       COL_LABEL,  COL_WIN_FACE);
+    surf_text(s, vx, y, "FAT32",         COL_WIN_TEXT, COL_WIN_FACE);
+    y += ls;
+
+    surf_text(s, lx, y, "INPUT",         COL_LABEL,  COL_WIN_FACE);
+    surf_text(s, vx, y, "PS/2 KB + MOUSE", COL_WIN_TEXT, COL_WIN_FACE);
+    y += ls + 8;
+
+    /* ---- Footer ---- */
+    surf_hline(s, lx, y - 4, (int32_t)s->width - lx * 2, COL_WIN_BORDER_A);
+    surf_text(s, lx, y, "CLOSE WINDOW TO RETURN TO SHELL",
+              COL_LABEL, COL_WIN_FACE);
 }
 
 static void cmd_gui(void) {
@@ -402,8 +575,7 @@ static void cmd_gui(void) {
             sw / 2 - 260, sh / 2 - 160, 520, 320,
             welcome_paint, NULL, NULL);
     wm_run();
-    /* All windows closed — redraw the shell header */
-    vga_init();
+    shell_draw_header();
 }
 
 static void cmd_exec(void) {
@@ -453,6 +625,8 @@ static const struct command commands[] = {
     {"cp",cmd_cp},{"mv",cmd_mv},
     {"whoami",cmd_whoami},{"uname",cmd_uname},
     {"hexdump",cmd_hexdump},{"exec",cmd_exec},
+    {"ifconfig",cmd_ifconfig},{"ping",cmd_ping},
+    {"pkg",cmd_pkg_sh},
     {"gui",cmd_gui},
 };
 #define NUM_COMMANDS (sizeof(commands)/sizeof(commands[0]))
@@ -473,19 +647,7 @@ static void dispatch(void) {
 /* ------------------------------------------------------------------ */
 
 void shell_run(void) {
-    /* Coloured header strip */
-    uint32_t bar_h = (uint32_t)FONT_HEIGHT;
-    fb_fill_rect(0, 0, fb_cols() * FONT_WIDTH, bar_h, 0x1A1A2E);
-    fb_draw_hline(0, bar_h - 1, fb_cols() * FONT_WIDTH, 0x4444AA);
-    fb_set_cursor(1, 0);
-    vga_print_colored("AusverseOS", VGA_YELLOW, VGA_BLACK);
-    vga_set_color(VGA_WHITE, VGA_BLACK);
-
-    fb_set_cursor(0, 1);
-    vga_print_colored("AusverseOS shell", VGA_YELLOW, VGA_BLACK);
-    vga_print(" - type ");
-    vga_print_colored("help", VGA_LCYAN, VGA_BLACK);
-    vga_print(" for commands\n\n");
+    shell_draw_header();
 
     for (;;) {
         vga_print_colored(vfs_pwd(), VGA_LCYAN, VGA_BLACK);

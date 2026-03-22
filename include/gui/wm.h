@@ -4,9 +4,9 @@
 
 #define WM_MAX_WINDOWS 8
 
-/* Paint callback: draw app content into 'client' rect on the screen surface.
-   All coordinates are screen-absolute. */
-typedef void (*wm_paint_fn)(struct surface *s, struct rect client, void *ud);
+/* Paint callback: draw app content into the window's own backing surface.
+   Origin (0,0) is the top-left of the client area. */
+typedef void (*wm_paint_fn)(struct surface *s, void *ud);
 
 /* Key callback: active window receives each keypress. */
 typedef void (*wm_key_fn)(char key, void *ud);

@@ -17,12 +17,13 @@
 #include "drivers/mouse.h"
 #include "drivers/usb_tablet.h"
 #include "core/multiboot2.h"
+#include "net/net.h"
 
 /* ------------------------------------------------------------------ */
 /* Composite IRQ0 handler                                               */
 /*   - PIT tick (uptime counter)                                        */
 /*   - Cursor blink                                                     */
-/*   - render_flush at ~50 fps (every 2 ticks at 100 Hz)               */
+/*   - render_flush at ~30 fps (every 8 ticks at 250 Hz)               */
 /* ------------------------------------------------------------------ */
 
 static uint32_t flush_divider = 0;
@@ -31,7 +32,7 @@ static void timer_tick(void) {
     pit_tick();
     fb_cursor_tick();
 
-    if (++flush_divider >= 2) {
+    if (++flush_divider >= 2) {    /* 30 fps at 60 Hz */
         flush_divider = 0;
         render_flush();
     }
@@ -124,6 +125,24 @@ void kernel_main(uint32_t magic, void *mbi) {
     } else {
         vga_print_colored("[  ] ", VGA_LGREY, VGA_BLACK);
         vga_print("USB tablet not found (using PS/2 mouse)\n");
+    }
+
+    int net_err = net_init();
+    if (net_err == 0) {
+        vga_print_colored("[OK] ", VGA_LGREEN, VGA_BLACK);
+        vga_print("Network ready (");
+        uint8_t ip4[4]; net_get_ip(ip4);
+        for (int i = 0; i < 4; i++) {
+            vga_print_uint(ip4[i]);
+            if (i < 3) vga_putchar('.');
+        }
+        vga_print(")\n");
+    } else if (net_err == -1) {
+        vga_print_colored("[  ] ", VGA_LGREY, VGA_BLACK);
+        vga_print("E1000 NIC not found - set adapter to Intel PRO/1000 MT Desktop\n");
+    } else {
+        vga_print_colored("[  ] ", VGA_LGREY, VGA_BLACK);
+        vga_print("DHCP timeout - NIC found but no IP assigned\n");
     }
 
     shell_run();

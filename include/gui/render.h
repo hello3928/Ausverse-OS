@@ -11,22 +11,51 @@ typedef uint32_t color_t;   /* 0x00RRGGBB */
 #define RGB(r,g,b)  ((color_t)(((uint32_t)(r)<<16)|((uint32_t)(g)<<8)|(uint32_t)(b)))
 
 /* ------------------------------------------------------------------ */
-/* Windows 95 system colour palette                                    */
+/* System colour palette — dark/red theme                              */
 /* ------------------------------------------------------------------ */
 
-#define COL_DESKTOP        RGB(0,   128, 128)   /* classic teal desktop    */
-#define COL_WIN_FACE       RGB(192, 192, 192)   /* button / window face    */
-#define COL_WIN_HILIGHT    RGB(255, 255, 255)   /* 3D highlight            */
-#define COL_WIN_LIGHT      RGB(223, 223, 223)   /* 3D light                */
-#define COL_WIN_SHADOW     RGB(128, 128, 128)   /* 3D shadow               */
-#define COL_WIN_DKSHADOW   RGB(0,   0,   0)     /* 3D dark shadow          */
-#define COL_WIN_TITLEBAR   RGB(0,   0,   128)   /* active title bar        */
-#define COL_WIN_TITLEBAR_I RGB(128, 128, 128)   /* inactive title bar      */
-#define COL_WIN_TITLETEXT  RGB(255, 255, 255)   /* title text              */
-#define COL_WIN_TEXT       RGB(0,   0,   0)     /* client-area text        */
-#define COL_BLACK          RGB(0,   0,   0)
+/* Desktop */
+#define COL_DESKTOP_TOP    RGB(  6,   6,   6)   /* near-black top          */
+#define COL_DESKTOP_BTM    RGB( 14,   8,   8)   /* very slight warm bottom */
+
+/* Window chrome */
+#define COL_WIN_FACE       RGB( 10,  10,  10)   /* client area — near black */
+#define COL_WIN_TITLEBAR   RGB(  5,   5,   5)   /* active title bar        */
+#define COL_WIN_TITLEBAR_I RGB(  9,   9,   9)   /* inactive title bar      */
+#define COL_WIN_TITLETEXT  RGB(190, 190, 190)   /* title text — light grey */
+#define COL_WIN_TEXT       RGB(160, 160, 160)   /* client text — grey      */
+#define COL_WIN_SHADOW     RGB( 40,  40,  40)   /* divider / subtle line   */
+#define COL_WIN_BORDER_A   RGB(180,   0,   0)   /* active border — red     */
+#define COL_WIN_BORDER_I   RGB( 24,  24,  24)   /* inactive border         */
+#define COL_WIN_SEPARATOR  RGB( 18,  18,  18)   /* title/client divider    */
+
+/* Chrome buttons */
+#define COL_BTN_CLOSE      RGB(140,   0,   0)   /* close — dark red        */
+#define COL_BTN_ICON       RGB(200, 200, 200)   /* icon on buttons         */
+
+/* Drop shadow */
+#define COL_SHADOW         RGB(  0,   0,   0)   /* pure black shadow       */
+
+/* Taskbar */
+#define COL_TASKBAR_BG     RGB(  3,   3,   3)   /* near-black              */
+#define COL_TASKBAR_BORDER RGB( 30,   0,   0)   /* very dark red border    */
+#define COL_TASKBAR_TEXT   RGB(120, 120, 120)   /* dim grey text           */
+#define COL_START_BG       RGB(150,   0,   0)   /* start button — red      */
+
+/* Accent */
+#define COL_ACCENT         RGB(200,   0,   0)   /* primary accent — red    */
+#define COL_LABEL          RGB(110,  20,  20)   /* dim red for info labels */
+
+/* Convenience */
+#define COL_BLACK          RGB(  0,   0,   0)
 #define COL_WHITE          RGB(255, 255, 255)
-#define COL_GREY           RGB(192, 192, 192)
+
+/* Legacy aliases */
+#define COL_WIN_HILIGHT    COL_WHITE
+#define COL_WIN_LIGHT      RGB( 20,  20,  20)
+#define COL_WIN_DKSHADOW   RGB(  8,   8,   8)
+#define COL_DESKTOP        COL_DESKTOP_TOP
+#define COL_GREY           RGB(100, 100, 100)
 
 /* ------------------------------------------------------------------ */
 /* Rectangle                                                            */
@@ -65,6 +94,11 @@ void render_pause_auto(int pause);
 
 /* Always flush, regardless of pause state.                           */
 void render_flush_now(void);
+
+/* Flush scene buffer then draw the cursor directly on the hardware
+ * framebuffer.  Cursor is never in the scene buffer so mouse movement
+ * only costs one blit — no scene repaint needed.                     */
+void render_flush_with_cursor(int32_t cx, int32_t cy);
 
 /* The primary screen surface (wraps the back buffer).                 */
 struct surface *render_screen(void);
@@ -123,3 +157,4 @@ void surf_window(struct surface *s, struct rect r,
 
 /* Fill s with the classic teal desktop gradient / solid. */
 void surf_desktop(struct surface *s);
+

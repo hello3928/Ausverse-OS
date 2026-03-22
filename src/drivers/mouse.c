@@ -79,11 +79,11 @@ static void mouse_irq(void) {
     int32_t sw = (int32_t)render_width();
     int32_t sh = (int32_t)render_height();
 
-    state.x -= dx;
-    state.y += dy;
+    state.x += dx;
+    state.y -= dy;
 
-    state.dx = -dx;
-    state.dy =  dy;
+    state.dx =  dx;
+    state.dy = -dy;
 
     if (state.x < 0)       state.x = 0;
     if (state.y < 0)       state.y = 0;

@@ -147,17 +147,17 @@ static void pci_write16(uint8_t bus, uint8_t dev, uint8_t fn,
 #undef TD_STATUS_CERR
 #undef TD_STATUS_SPD
 
-#define TD_STATUS_BITSTUF  (1u << 16)
-#define TD_STATUS_CRCTO    (1u << 17)
-#define TD_STATUS_NAK      (1u << 18)
-#define TD_STATUS_BABBLE   (1u << 19)
-#define TD_STATUS_DBUFERR  (1u << 20)
-#define TD_STATUS_STALLED  (1u << 21)
-#define TD_STATUS_ACTIVE   (1u << 22)  /* UHCI spec: Active is bit 22 */
-#define TD_STATUS_IOC      (1u << 23)
-#define TD_STATUS_LS       (1u << 25)  /* low-speed device */
-#define TD_STATUS_CERR(n)  (((uint32_t)(n) & 3u) << 26)
-#define TD_STATUS_SPD      (1u << 28)
+#define TD_STATUS_BITSTUF  (1u << 17)
+#define TD_STATUS_CRCTO    (1u << 18)
+#define TD_STATUS_NAK      (1u << 19)
+#define TD_STATUS_BABBLE   (1u << 20)
+#define TD_STATUS_DBUFERR  (1u << 21)
+#define TD_STATUS_STALLED  (1u << 22)
+#define TD_STATUS_ACTIVE   (1u << 23)  /* Linux uhci-hw.h: Active is bit 23 */
+#define TD_STATUS_IOC      (1u << 24)
+#define TD_STATUS_LS       (1u << 26)  /* low-speed device */
+#define TD_STATUS_CERR(n)  (((uint32_t)(n) & 3u) << 27)
+#define TD_STATUS_SPD      (1u << 29)
 
 /* TD token field encoding
  *  bits  7:0  = PID
@@ -286,6 +286,9 @@ static inline uint16_t hc_read16(uint16_t reg) {
 static inline void hc_write32(uint16_t reg, uint32_t val) {
     outl((uint16_t)(g_iobase + reg), val);
 }
+static inline uint32_t hc_read32(uint16_t reg) {
+    return inl((uint16_t)(g_iobase + reg));
+}
 
 /* ========================================================================= */
 /* Control transfer engine                                                    */
@@ -364,7 +367,18 @@ static int issue_control(const uint8_t *setup_pkt,
     /* Remove QH from frame list */
     for (int i = 0; i < 1024; i++) g_fl[i] = LP_TERM;
 
-    if (!ok) return -1;
+    if (!ok) {
+        vga_print("[USB] timeout: TD0.status=");
+        vga_print_uint(ctrl_tds[0].status);
+        vga_print(" USBSTS=");
+        vga_print_uint(hc_read16(USBSTS));
+        vga_print(" FRNUM=");
+        vga_print_uint(hc_read16(FRNUM));
+        vga_print(" QH.elem=");
+        vga_print_uint(ctrl_qh.element);
+        vga_print("\n");
+        return -1;
+    }
     if (std->status & (TD_STATUS_STALLED | TD_STATUS_BABBLE |
                        TD_STATUS_DBUFERR | TD_STATUS_CRCTO)) return -1;
     return 0;
@@ -554,7 +568,11 @@ int usb_tablet_init(void) {
     if (!WAIT_FOR(!(hc_read16(USBSTS) & (1u << 5)), 100)) {
         vga_print("[USB] HC start timeout\n"); return -1;
     }
-    vga_print("[USB] HC running\n");
+    vga_print("[USB] HC running, FRBASE=");
+    vga_print_uint(hc_read32(FRBASEADD));
+    vga_print(" g_fl=");
+    vga_print_uint((uint32_t)(uintptr_t)g_fl);
+    vga_print("\n");
 
     /* ---- Reset port 1 ---- */
     delay_ms(100);

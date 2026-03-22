@@ -15,8 +15,8 @@ multiboot_header_start:
     dw 5            ; type
     dw 1            ; flags: optional (don't fail if unavailable)
     dd 20           ; size
-    dd 1920         ; preferred width
-    dd 1080         ; preferred height
+    dd 1280         ; preferred width
+    dd 1024         ; preferred height
     dd 32           ; preferred depth (bpp)
 
     align 8         ; tags must be 8-byte aligned

@@ -11,10 +11,18 @@
 /* automatically because they're within kernel_end.                    */
 /* ------------------------------------------------------------------ */
 
-#define MAX_WIDTH  1920
-#define MAX_HEIGHT 1080
+#define MAX_WIDTH  1280
+#define MAX_HEIGHT 1024
 
 static uint32_t back_buffer[MAX_WIDTH * MAX_HEIGHT];
+
+/* Expanded row for 2x upscale blit (3840 pixels wide) */
+static uint32_t row_buf[MAX_WIDTH * 2];
+
+/* Pre-computed desktop gradient — filled once, blitted on every repaint.
+ * Avoids re-running 1080 hline calls (expensive in QEMU TCG mode). */
+static uint32_t desktop_buf[MAX_WIDTH * MAX_HEIGHT];
+static int      desktop_ready = 0;
 
 /* ------------------------------------------------------------------ */
 /* Hardware framebuffer metadata (set by render_init)                  */
@@ -22,9 +30,11 @@ static uint32_t back_buffer[MAX_WIDTH * MAX_HEIGHT];
 
 static int       auto_flush  = 1;    /* 0 = paused by GUI */
 static uint8_t  *hw_fb       = NULL;
-static uint32_t  hw_width    = 0;
+static uint32_t  hw_width    = 0;   /* render resolution (1080p) */
 static uint32_t  hw_height   = 0;
 static uint32_t  hw_pitch    = 0;   /* bytes per row, hardware side */
+static uint32_t  fb_width    = 0;   /* true framebuffer width (may be 4K) */
+static uint32_t  fb_height   = 0;   /* true framebuffer height */
 
 /* ------------------------------------------------------------------ */
 /* Screen surface                                                       */
@@ -34,10 +44,13 @@ static struct surface screen_surf;
 
 void render_init(uint64_t hw_fb_addr, uint32_t width, uint32_t height,
                  uint32_t hw_pitch_bytes) {
-    hw_fb    = (uint8_t *)(uintptr_t)hw_fb_addr;
+    hw_fb     = (uint8_t *)(uintptr_t)hw_fb_addr;
+    fb_width  = width;
+    fb_height = height;
+    hw_pitch  = hw_pitch_bytes;
+    /* Render at 1080p regardless of actual framebuffer size */
     hw_width  = width  < MAX_WIDTH  ? width  : MAX_WIDTH;
     hw_height = height < MAX_HEIGHT ? height : MAX_HEIGHT;
-    hw_pitch  = hw_pitch_bytes;
 
     screen_surf.pixels = back_buffer;
     screen_surf.width  = hw_width;
@@ -53,11 +66,39 @@ void render_init(uint64_t hw_fb_addr, uint32_t width, uint32_t height,
  * so pitch mismatches are handled correctly.
  */
 static void do_flush(void) {
-    for (uint32_t y = 0; y < hw_height; y++) {
-        const uint32_t *src = back_buffer + y * hw_width;
-        uint32_t       *dst = (uint32_t *)(hw_fb + y * hw_pitch);
-        for (uint32_t x = 0; x < hw_width; x++)
-            dst[x] = src[x];
+    if (fb_width == hw_width * 2u && fb_height == hw_height * 2u) {
+        /* 2x upscale: each 1080p pixel → 2×2 block in 4K framebuffer */
+        for (uint32_t y = 0; y < hw_height; y++) {
+            const uint32_t *src = back_buffer + y * hw_width;
+            /* Expand row: pixel x → row_buf[2x], row_buf[2x+1] */
+            for (uint32_t x = 0; x < hw_width; x++)
+                row_buf[x * 2] = row_buf[x * 2 + 1] = src[x];
+            /* Write expanded row to two consecutive 4K rows */
+            for (uint32_t r = 0; r < 2; r++) {
+                void    *s   = row_buf;
+                void    *d   = hw_fb + (y * 2 + r) * hw_pitch;
+                uint32_t n   = hw_width * 2;
+                __asm__ volatile ("rep movsl"
+                    : "+c"(n), "+S"(s), "+D"(d) :: "memory");
+            }
+        }
+    } else {
+        /* 1:1 blit */
+        if (hw_pitch == hw_width * 4u) {
+            uint32_t n   = hw_width * hw_height;
+            void    *src = back_buffer;
+            void    *dst = hw_fb;
+            __asm__ volatile ("rep movsl"
+                : "+c"(n), "+S"(src), "+D"(dst) :: "memory");
+        } else {
+            for (uint32_t y = 0; y < hw_height; y++) {
+                uint32_t  n   = hw_width;
+                void     *src = back_buffer + y * hw_width;
+                void     *dst = hw_fb + y * hw_pitch;
+                __asm__ volatile ("rep movsl"
+                    : "+c"(n), "+S"(src), "+D"(dst) :: "memory");
+            }
+        }
     }
 }
 
@@ -69,6 +110,45 @@ void render_flush(void) {
 void render_flush_now(void) {
     if (!hw_fb) return;
     do_flush();
+}
+
+/* ------------------------------------------------------------------ */
+/* Cursor-composited flush                                              */
+/*                                                                      */
+/* The scene buffer never contains the cursor.  After blitting the     */
+/* scene to hardware we stamp the cursor directly on the hw fb.        */
+/* Next flush overwrites those pixels with the clean scene again.      */
+/* ------------------------------------------------------------------ */
+
+static void draw_cursor_hw(int32_t x, int32_t y) {
+    /* Scale factor: 1 for 1:1, 2 when hw fb is 2× the render size   */
+    uint32_t scale = (fb_width == hw_width * 2u && fb_height == hw_height * 2u)
+                     ? 2u : 1u;
+
+    for (int32_t r = 0; r < 16; r++) {
+        for (int32_t c = 0; c <= 15 - r; c++) {
+            int      edge  = (c == 0) || (r == 0) || (c + r == 15);
+            uint32_t color = edge ? 0x000000u : 0xFFFFFFu;
+
+            for (uint32_t sy = 0; sy < scale; sy++) {
+                for (uint32_t sx = 0; sx < scale; sx++) {
+                    int32_t px = x * (int32_t)scale + c * (int32_t)scale + (int32_t)sx;
+                    int32_t py = y * (int32_t)scale + r * (int32_t)scale + (int32_t)sy;
+                    if (px < 0 || py < 0 ||
+                        (uint32_t)px >= fb_width ||
+                        (uint32_t)py >= fb_height) continue;
+                    *(uint32_t *)(hw_fb + (uint32_t)py * hw_pitch
+                                        + (uint32_t)px * 4u) = color;
+                }
+            }
+        }
+    }
+}
+
+void render_flush_with_cursor(int32_t cx, int32_t cy) {
+    if (!hw_fb) return;
+    do_flush();
+    draw_cursor_hw(cx, cy);
 }
 
 void render_pause_auto(int pause) {
@@ -93,9 +173,10 @@ static inline void spx(struct surface *s, uint32_t x, uint32_t y, uint32_t c) {
 /* ------------------------------------------------------------------ */
 
 void surf_clear(struct surface *s, color_t c) {
-    uint32_t total = s->height * s->stride;
-    for (uint32_t i = 0; i < total; i++)
-        s->pixels[i] = c;
+    uint32_t  n   = s->height * s->stride;
+    void     *dst = s->pixels;
+    __asm__ volatile ("rep stosl"
+        : "+c"(n), "+D"(dst) : "a"(c) : "memory");
 }
 
 void surf_pixel(struct surface *s, int32_t x, int32_t y, color_t c) {
@@ -110,9 +191,14 @@ void surf_fill_rect(struct surface *s, struct rect r, color_t c) {
     if (r.y < 0) r.y = 0;
     if (x2 > (int32_t)s->width)  x2 = (int32_t)s->width;
     if (y2 > (int32_t)s->height) y2 = (int32_t)s->height;
-    for (int32_t py = r.y; py < y2; py++)
-        for (int32_t px = r.x; px < x2; px++)
-            spx(s, (uint32_t)px, (uint32_t)py, c);
+    uint32_t n = (uint32_t)(x2 - r.x);
+    if ((int32_t)n <= 0) return;
+    for (int32_t py = r.y; py < y2; py++) {
+        void *dst = s->pixels + (uint32_t)py * s->stride + (uint32_t)r.x;
+        uint32_t cnt = n;
+        __asm__ volatile ("rep stosl"
+            : "+c"(cnt), "+D"(dst) : "a"(c) : "memory");
+    }
 }
 
 void surf_hline(struct surface *s, int32_t x, int32_t y, int32_t w, color_t c) {
@@ -120,8 +206,10 @@ void surf_hline(struct surface *s, int32_t x, int32_t y, int32_t w, color_t c) {
     if (x < 0) { w += x; x = 0; }
     if (x + w > (int32_t)s->width) w = (int32_t)s->width - x;
     if (w <= 0) return;
-    uint32_t *row = s->pixels + (uint32_t)y * s->stride + (uint32_t)x;
-    for (int32_t i = 0; i < w; i++) row[i] = c;
+    void    *dst = s->pixels + (uint32_t)y * s->stride + (uint32_t)x;
+    uint32_t n   = (uint32_t)w;
+    __asm__ volatile ("rep stosl"
+        : "+c"(n), "+D"(dst) : "a"(c) : "memory");
 }
 
 void surf_vline(struct surface *s, int32_t x, int32_t y, int32_t h, color_t c) {
@@ -197,44 +285,26 @@ void surf_text_transp(struct surface *s, int32_t x, int32_t y,
 }
 
 /* ------------------------------------------------------------------ */
-/* Windows 95-style 3D chrome                                          */
+/* Chrome geometry                                                      */
 /* ------------------------------------------------------------------ */
 
-/*
- * 2-pixel raised border (inside r):
- *   top/left  outer: COL_WIN_HILIGHT  (white)
- *   top/left  inner: COL_WIN_LIGHT    (light gray)
- *   bot/right inner: COL_WIN_SHADOW   (mid gray)
- *   bot/right outer: COL_WIN_DKSHADOW (black)
- */
+#define TITLEBAR_H  (FONT_HEIGHT + 10)  /* 26px — modern, comfortable  */
+#define CHROME_BTN  16                  /* fixed button size            */
+
+/* ------------------------------------------------------------------ */
+/* Flat stubs — kept so external code still compiles                   */
+/* ------------------------------------------------------------------ */
+
 void surf_raised(struct surface *s, struct rect r) {
-    /* outer */
-    surf_hline(s, r.x,         r.y,         r.w,   COL_WIN_HILIGHT);
-    surf_hline(s, r.x,         r.y+r.h-1,   r.w,   COL_WIN_DKSHADOW);
-    surf_vline(s, r.x,         r.y,         r.h,   COL_WIN_HILIGHT);
-    surf_vline(s, r.x+r.w-1,   r.y,         r.h,   COL_WIN_DKSHADOW);
-    /* inner */
-    surf_hline(s, r.x+1,       r.y+1,       r.w-2, COL_WIN_LIGHT);
-    surf_hline(s, r.x+1,       r.y+r.h-2,   r.w-2, COL_WIN_SHADOW);
-    surf_vline(s, r.x+1,       r.y+1,       r.h-2, COL_WIN_LIGHT);
-    surf_vline(s, r.x+r.w-2,   r.y+1,       r.h-2, COL_WIN_SHADOW);
+    surf_outline_rect(s, r, COL_WIN_SHADOW);
 }
 
 void surf_sunken(struct surface *s, struct rect r) {
-    /* outer */
-    surf_hline(s, r.x,         r.y,         r.w,   COL_WIN_SHADOW);
-    surf_hline(s, r.x,         r.y+r.h-1,   r.w,   COL_WIN_HILIGHT);
-    surf_vline(s, r.x,         r.y,         r.h,   COL_WIN_SHADOW);
-    surf_vline(s, r.x+r.w-1,   r.y,         r.h,   COL_WIN_HILIGHT);
-    /* inner */
-    surf_hline(s, r.x+1,       r.y+1,       r.w-2, COL_WIN_DKSHADOW);
-    surf_hline(s, r.x+1,       r.y+r.h-2,   r.w-2, COL_WIN_LIGHT);
-    surf_vline(s, r.x+1,       r.y+1,       r.h-2, COL_WIN_DKSHADOW);
-    surf_vline(s, r.x+r.w-2,   r.y+1,       r.h-2, COL_WIN_LIGHT);
+    surf_outline_rect(s, r, COL_WIN_DKSHADOW);
 }
 
 /* ------------------------------------------------------------------ */
-/* Button                                                               */
+/* Button — flat modern style                                           */
 /* ------------------------------------------------------------------ */
 
 static uint32_t slen(const char *s) {
@@ -243,103 +313,110 @@ static uint32_t slen(const char *s) {
 
 void surf_button(struct surface *s, struct rect r,
                  const char *label, int pressed) {
-    /* Face */
-    struct rect inner = {r.x+2, r.y+2, r.w-4, r.h-4};
-    surf_fill_rect(s, inner, COL_WIN_FACE);
-
-    /* 3D border */
-    if (pressed) surf_sunken(s, r);
-    else         surf_raised(s, r);
-
-    /* Label centred */
+    color_t face = pressed ? COL_ACCENT : COL_WIN_FACE;
+    color_t text = pressed ? COL_WHITE  : COL_WIN_TEXT;
+    surf_fill_rect(s, r, face);
+    surf_outline_rect(s, r, COL_WIN_BORDER_I);
     if (label) {
         int32_t lw = (int32_t)(slen(label) * FONT_WIDTH);
-        int32_t lh = (int32_t)FONT_HEIGHT;
         int32_t lx = r.x + (r.w - lw) / 2 + (pressed ? 1 : 0);
-        int32_t ly = r.y + (r.h - lh) / 2 + (pressed ? 1 : 0);
-        surf_text(s, lx, ly, label, COL_WIN_TEXT, COL_WIN_FACE);
+        int32_t ly = r.y + (r.h - (int32_t)FONT_HEIGHT) / 2 + (pressed ? 1 : 0);
+        surf_text(s, lx, ly, label, text, face);
     }
 }
 
 /* ------------------------------------------------------------------ */
-/* Window frame                                                         */
+/* Window frame — flat, modern, drop-shadowed                          */
 /* ------------------------------------------------------------------ */
-
-#define TITLEBAR_H  (FONT_HEIGHT + 4)   /* pixels tall */
-#define CHROME_BTN  (TITLEBAR_H - 2)    /* close/min/max button size */
 
 void surf_window(struct surface *s, struct rect r,
                  const char *title, int active) {
-    /* ---- Outer black border ---- */
-    surf_outline_rect(s, r, COL_BLACK);
+    /* Drop shadow (drawn first — windows above will overdraw it) */
+    surf_fill_rect(s, make_rect(r.x + 4, r.y + 4, r.w, r.h), COL_SHADOW);
 
-    /* ---- Outer raised border (inside the black) ---- */
-    struct rect raised = {r.x+1, r.y+1, r.w-2, r.h-2};
-    surf_raised(s, raised);
+    /* Outer border — 1 px, accent when active */
+    color_t border = active ? COL_WIN_BORDER_A : COL_WIN_BORDER_I;
+    surf_outline_rect(s, r, border);
 
-    /* ---- Title bar ---- */
-    color_t bar_col = active ? COL_WIN_TITLEBAR : COL_WIN_TITLEBAR_I;
-    struct rect bar = {r.x+2, r.y+2, r.w-4, TITLEBAR_H};
-    surf_fill_rect(s, bar, bar_col);
+    /* Title bar */
+    color_t bar = active ? COL_WIN_TITLEBAR : COL_WIN_TITLEBAR_I;
+    struct rect title_bar = {r.x + 1, r.y + 1, r.w - 2, TITLEBAR_H};
+    surf_fill_rect(s, title_bar, bar);
 
-    /* Title text */
-    if (title) {
-        surf_text_transp(s, bar.x + 4, bar.y + 2, title, COL_WIN_TITLETEXT);
+    /* Button vertical centre within title bar */
+    int32_t by = r.y + 1 + (TITLEBAR_H - CHROME_BTN) / 2;
+
+    /* Close button — red */
+    struct rect close_btn = {r.x + r.w - 3 - CHROME_BTN, by,
+                              CHROME_BTN, CHROME_BTN};
+    surf_fill_rect(s, close_btn, COL_BTN_CLOSE);
+    {   /* Centred "×" */
+        int32_t tx = close_btn.x + (CHROME_BTN - FONT_WIDTH)  / 2;
+        int32_t ty = close_btn.y + (CHROME_BTN - FONT_HEIGHT) / 2;
+        surf_text(s, tx, ty, "X", COL_BTN_ICON, COL_BTN_CLOSE);
     }
 
-    /* Close button [ X ] */
-    struct rect close_btn = {
-        r.x + r.w - 2 - CHROME_BTN,
-        r.y + 2,
-        CHROME_BTN,
-        CHROME_BTN
-    };
-    surf_button(s, close_btn, "X", 0);
+    /* Maximise button */
+    struct rect max_btn = {close_btn.x - 2 - CHROME_BTN, by,
+                           CHROME_BTN, CHROME_BTN};
+    surf_fill_rect(s, max_btn, bar);
+    surf_outline_rect(s, make_rect(max_btn.x + 3, max_btn.y + 3,
+                                   CHROME_BTN - 6, CHROME_BTN - 6),
+                      COL_BTN_ICON);
 
-    /* Maximise button [ □ ] */
-    struct rect max_btn = {
-        close_btn.x - 1 - CHROME_BTN,
-        r.y + 2,
-        CHROME_BTN,
-        CHROME_BTN
-    };
-    surf_button(s, max_btn, "O", 0);
+    /* Minimise button */
+    struct rect min_btn = {max_btn.x - 2 - CHROME_BTN, by,
+                           CHROME_BTN, CHROME_BTN};
+    surf_fill_rect(s, min_btn, bar);
+    surf_hline(s, min_btn.x + 3,
+                  min_btn.y + CHROME_BTN * 2 / 3,
+                  CHROME_BTN - 6, COL_BTN_ICON);
 
-    /* Minimise button [ _ ] */
-    struct rect min_btn = {
-        max_btn.x - 1 - CHROME_BTN,
-        r.y + 2,
-        CHROME_BTN,
-        CHROME_BTN
-    };
-    surf_button(s, min_btn, "_", 0);
+    /* Title text — vertically centred, left of buttons */
+    if (title) {
+        int32_t tx = r.x + 8;
+        int32_t ty = r.y + 1 + (TITLEBAR_H - (int32_t)FONT_HEIGHT) / 2;
+        surf_text_transp(s, tx, ty, title, COL_WIN_TITLETEXT);
+    }
 
-    /* ---- Separator line below title bar ---- */
-    surf_hline(s, r.x+2, r.y+2+TITLEBAR_H, r.w-4, COL_WIN_DKSHADOW);
+    /* Separator line */
+    surf_hline(s, r.x + 1, r.y + 1 + TITLEBAR_H, r.w - 2, COL_WIN_SEPARATOR);
 
-    /* ---- Client area fill ---- */
-    struct rect client = {
-        r.x + 2,
-        r.y + 2 + TITLEBAR_H + 1,
-        r.w - 4,
-        r.h - 4 - TITLEBAR_H - 1
-    };
+    /* Client area fill */
+    struct rect client = {r.x + 1, r.y + 2 + TITLEBAR_H,
+                          r.w - 2, r.h - 3 - TITLEBAR_H};
     surf_fill_rect(s, client, COL_WIN_FACE);
-
-    /* ---- Inner sunken border around client area ---- */
-    struct rect sunken = {
-        client.x - 1,
-        client.y - 1,
-        client.w + 2,
-        client.h + 2
-    };
-    surf_sunken(s, sunken);
 }
 
 /* ------------------------------------------------------------------ */
-/* Desktop                                                              */
+/* Desktop — pre-computed dark gradient                                 */
+/*                                                                      */
+/* The gradient is computed once into desktop_buf, then every repaint  */
+/* is a single rep movsl (one bulk copy) rather than 1080 hline calls. */
 /* ------------------------------------------------------------------ */
 
 void surf_desktop(struct surface *s) {
-    surf_clear(s, COL_DESKTOP);
+    if (!desktop_ready) {
+        /* Build gradient row by row into desktop_buf */
+        for (uint32_t y = 0; y < s->height; y++) {
+            uint32_t t   = y * 255u / (s->height > 1u ? s->height - 1u : 1u);
+            uint8_t  r2  = (uint8_t)( 6u + ( 8u * t >> 8));
+            uint8_t  g   = (uint8_t)( 6u + ( 2u * t >> 8));
+            uint8_t  b   = (uint8_t)( 6u + ( 2u * t >> 8));
+            color_t  col = RGB(r2, g, b);
+            void    *dst = desktop_buf + y * s->width;
+            uint32_t n   = s->width;
+            __asm__ volatile ("rep stosl"
+                : "+c"(n), "+D"(dst) : "a"(col) : "memory");
+        }
+        desktop_ready = 1;
+    }
+
+    /* Fast blit: single rep movsl, same cost as surf_clear */
+    uint32_t  n   = s->height * s->width;  /* stride == width (packed) */
+    void     *src = desktop_buf;
+    void     *dst = s->pixels;
+    __asm__ volatile ("rep movsl"
+        : "+c"(n), "+S"(src), "+D"(dst) :: "memory");
 }
+
